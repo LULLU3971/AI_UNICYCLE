@@ -1,0 +1,498 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>AI Unicycle</title>
+    <link rel="icon" href="data:,">
+    <style>
+        :root {
+            --bg-color: #f0f4f7;
+            --ground-color: #dcdfe2;
+            --ground-line-color: #c0c4c8;
+            --sky-color: #a3d5ee;
+            --player-wheel-color: #34495e;
+            --player-frame-color: #34495e;
+            --player-seat-color: #e74c3c;
+            --particle-color: #f39c12;
+            --font-color: #2c3e50;
+        }
+        body {
+            margin: 0;
+            padding: 0;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            flex-direction: column;
+            height: 100vh;
+            background-color: var(--bg-color);
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+            color: var(--font-color);
+        }
+        #game-container {
+            position: relative;
+            width: 800px;
+            height: 600px;
+            box-shadow: 0 10px 25px rgba(0, 0, 0, 0.1);
+            border-radius: 12px;
+            overflow: hidden;
+            background-color: var(--sky-color);  /* 배경색 추가 */
+        }
+        
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+        }
+        
+        #loader {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: rgba(255, 255, 255, 0.9);
+            padding: 20px;
+            border-radius: 8px;
+            text-align: center;
+            transition: opacity 0.5s;
+            z-index: 1000;
+        }
+        #loader-dot {
+            width: 15px;
+            height: 15px;
+            background-color: var(--font-color);
+            border-radius: 50%;
+            animation: pulse 1.5s infinite ease-in-out;
+        }
+        @keyframes pulse {
+            0%, 100% { transform: scale(0.8); opacity: 0.7; }
+            50% { transform: scale(1.2); opacity: 1; }
+        }
+        #info-overlay {
+            position: absolute;
+            top: 20px;
+            left: 20px;
+            font-size: 1.5em;
+            font-weight: bold;
+        }
+        #status-overlay {
+            position: absolute;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            font-size: 3em;
+            font-weight: bold;
+            color: var(--player-seat-color);
+            opacity: 0;
+            transition: opacity 0.3s ease;
+            text-shadow: 2px 2px 5px rgba(0,0,0,0.2);
+        }
+    </style>
+</head>
+<body>
+    <h1>AI Unicycle</h1>
+    <div id="game-container">
+        <canvas id="gameCanvas"></canvas>
+        <div id="loader">
+            <div id="loader-dot"></div>
+            <span>Loading AI Model...</span>
+        </div>
+        <div id="info-overlay">Score: 0</div>
+        <div id="status-overlay"></div>
+    </div>
+    <script src="https://cdn.jsdelivr.net/npm/onnxruntime-web/dist/ort.min.js"></script>
+    <script>
+    document.addEventListener('DOMContentLoaded', async () => {
+        // --- DOM Elements ---
+        const canvas = document.getElementById('gameCanvas');
+        const ctx = canvas.getContext('2d');
+        const loader = document.getElementById('loader');
+        const infoOverlay = document.getElementById('info-overlay');
+        const statusOverlay = document.getElementById('status-overlay');
+
+        // --- Color Palette ---
+        const computedStyles = getComputedStyle(document.documentElement);
+        const colors = {
+            bgColor: computedStyles.getPropertyValue('--bg-color').trim(),
+            groundColor: computedStyles.getPropertyValue('--ground-color').trim(),
+            groundLineColor: computedStyles.getPropertyValue('--ground-line-color').trim(),
+            playerFrameColor: computedStyles.getPropertyValue('--player-frame-color').trim(),
+            playerSeatColor: computedStyles.getPropertyValue('--player-seat-color').trim(),
+            playerWheelColor: computedStyles.getPropertyValue('--player-wheel-color').trim(),
+            particleColor: computedStyles.getPropertyValue('--particle-color').trim(),
+        };
+
+        // --- Game & Rendering Constants ---
+        const SCREEN_WIDTH = 800;
+        const SCREEN_HEIGHT = 600;
+        const GROUND_Y = SCREEN_HEIGHT - 80;
+        
+        // --- Physics Constants (tuned to match Python env) ---
+        const GRAVITY = 0.0020;
+        const PLAYER_TORQUE = 0.003;
+        const FRICTION = 0.995;
+        const SPEED_ACCEL = 0.1;
+        const SPEED_FRICTION = 0.98;
+        const ANGLE_SPEED_EFFECT = 0.03;
+                const JUMP_GRAVITY = 0.4; // Used for vertical seat physics
+        const WOBBLE_STRENGTH = 0.0010;
+
+        // --- AI Model Constants (from environment.py) ---
+        const W_SCALE = 0.5;
+        const V_SCALE = 10.0;
+        const CLEARANCE_SCALE = 150.0;
+
+        // --- Game State ---
+        let unicycle;
+        let particles = [];
+        let score = 0;
+        let gameOver = false;
+        let session;
+
+        // --- Unicycle Class ---
+        class Unicycle {
+            constructor(x, y) {
+                this.wheelRadius = 40;
+                this.frameLength = 120;
+                this.seatWidth = 40;
+                this.seatHeight = 15;
+                this.reset(x, y);
+            }
+
+            reset(x, y) {
+                this.x = x;
+                this.y = y;
+                this.angle = 0.0;
+                this.angularVelocity = 0.0;
+                this.speed = 0.0;
+                this.yVelocity = 0.0; // For seat physics
+            }
+
+            getSeatRect() {
+                const seatWidth = 30;
+                const seatHeight = 20;
+                // 안장 위치 계산 보정
+                const seatDistance = 80;
+                const seatX = this.x - seatWidth / 2 + Math.sin(this.angle) * seatDistance;
+                const seatY = this.y - Math.cos(this.angle) * seatDistance;
+                
+                // 여유 공간 추가 (5픽셀)
+                const margin = 5;
+                return {
+                    left: seatX,
+                    right: seatX + seatWidth,
+                    top: seatY,
+                    bottom: seatY + seatHeight - margin
+                };
+            }
+
+            isSeatedFallen() {
+                const seatRect = this.getSeatRect();
+                // 여유값을 주어 정확한 충돌 판정
+                return seatRect.bottom >= GROUND_Y - 2;
+            }
+
+            update(action) {
+                // 1. Balance / Rotational Physics
+                const gravityTorque = GRAVITY * Math.sin(this.angle);
+                let playerTorque = 0.0;
+                
+                // Action mapping 수정
+                if (action === 3) playerTorque = -PLAYER_TORQUE;      // Balance Left
+                if (action === 4) playerTorque = PLAYER_TORQUE;       // Balance Right
+                
+                const wobbleTorque = (Math.random() * 2 - 1) * WOBBLE_STRENGTH;
+                const angularAccel = gravityTorque + playerTorque + wobbleTorque;
+                
+                this.angularVelocity += angularAccel;
+                this.angularVelocity *= FRICTION;
+                this.angle += this.angularVelocity;
+
+                // 2. Horizontal Physics
+                this.speed += ANGLE_SPEED_EFFECT * Math.sin(this.angle);
+                if (action === 1) this.speed += SPEED_ACCEL;         // Forward
+                if (action === 2) this.speed -= SPEED_ACCEL;         // Backward
+                
+                this.speed *= SPEED_FRICTION;
+                this.x += this.speed;
+
+                // 3. Vertical Physics
+                this.yVelocity += JUMP_GRAVITY;
+                this.y += this.yVelocity;
+                
+                // 바퀴의 바닥 충돌
+                if (this.y >= GROUND_Y) {
+                    this.y = GROUND_Y;
+                    this.yVelocity = 0;
+                }
+            }
+
+            draw(cameraOffsetX) {
+                const screenX = this.x - cameraOffsetX;
+                const wheelY = this.y - this.wheelRadius;
+
+                ctx.save();
+                ctx.translate(screenX, wheelY);
+                
+                // Draw Frame
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(this.frameLength * Math.sin(this.angle), -this.frameLength * Math.cos(this.angle));
+                ctx.lineWidth = 6;
+                ctx.strokeStyle = colors.playerFrameColor;
+                ctx.lineCap = 'round';
+                ctx.stroke();
+
+                // Draw Seat
+                ctx.save();
+                ctx.translate(this.frameLength * Math.sin(this.angle), -this.frameLength * Math.cos(this.angle));
+                ctx.rotate(this.angle); // Keep seat level
+                ctx.fillStyle = colors.playerSeatColor;
+                ctx.fillRect(-this.seatWidth / 2, -this.seatHeight / 2, this.seatWidth, this.seatHeight);
+                ctx.restore();
+                
+                ctx.restore();
+
+                // Draw Wheel (on top of frame)
+                ctx.beginPath();
+                ctx.arc(screenX, wheelY, this.wheelRadius, 0, Math.PI * 2);
+                ctx.fillStyle = colors.bgColor;
+                ctx.fill();
+                ctx.lineWidth = 8;
+                ctx.strokeStyle = colors.playerWheelColor;
+                ctx.stroke();
+            }
+        }
+        
+        // --- Particle System for visual feedback ---
+        function spawnParticles(x, y, count, type) {
+            for (let i = 0; i < count; i++) {
+                const angle = (type === 'speed') 
+                    ? Math.PI + (Math.random() - 0.5) * 0.5 
+                    : Math.random() * Math.PI * 2;
+                const speed = 2 + Math.random() * 2;
+                particles.push({
+                    x,
+                    y,
+                    vx: Math.cos(angle) * speed,
+                    vy: Math.sin(angle) * speed,
+                    life: 20 + Math.random() * 10,
+                    maxLife: 25,
+                });
+            }
+        }
+
+        function updateAndDrawParticles(cameraOffsetX) {
+            for (let i = particles.length - 1; i >= 0; i--) {
+                const p = particles[i];
+                p.x += p.vx;
+                p.y += p.vy;
+                p.vy += 0.1; // particle gravity
+                p.life--;
+
+                if (p.life <= 0) {
+                    particles.splice(i, 1);
+                    continue;
+                }
+
+                ctx.beginPath();
+                ctx.arc(p.x - cameraOffsetX, p.y, (p.life / p.maxLife) * 4, 0, Math.PI * 2);
+                ctx.fillStyle = colors.particleColor;
+                ctx.globalAlpha = p.life / p.maxLife;
+                ctx.fill();
+            }
+            ctx.globalAlpha = 1.0;
+        }
+
+        // --- Main Game Functions ---
+        function resetGame() {
+            unicycle = new Unicycle(SCREEN_WIDTH / 2, GROUND_Y);
+            unicycle.x = 0; // Start at world origin
+            score = 0;
+            gameOver = false;
+            particles = [];
+            statusOverlay.style.opacity = 0;
+            gameLoop();
+        }
+
+        function draw() {
+            ctx.clearRect(0, 0, SCREEN_WIDTH, SCREEN_HEIGHT);
+            const cameraOffsetX = unicycle.x - SCREEN_WIDTH / 4;
+
+            // Draw Ground
+            ctx.fillStyle = colors.groundColor;
+            ctx.fillRect(0, GROUND_Y, SCREEN_WIDTH, SCREEN_HEIGHT - GROUND_Y);
+
+            // Draw distance markers
+            const markerInterval = 150;
+            const startMarker = Math.floor(cameraOffsetX / markerInterval);
+            const endMarker = Math.ceil((cameraOffsetX + SCREEN_WIDTH) / markerInterval);
+            for (let i = startMarker; i <= endMarker; i++) {
+                const mx = i * markerInterval - cameraOffsetX;
+                ctx.beginPath();
+                ctx.moveTo(mx, GROUND_Y);
+                ctx.lineTo(mx, GROUND_Y + 15);
+                ctx.lineWidth = 2;
+                ctx.strokeStyle = colors.groundLineColor;
+                ctx.stroke();
+            }
+            
+            updateAndDrawParticles(cameraOffsetX);
+            unicycle.draw(cameraOffsetX);
+            
+            infoOverlay.textContent = `Score: ${Math.floor(unicycle.x)}`;
+        }
+
+        // gameLoop 함수 수정
+        async function gameLoop() {
+            if (gameOver) return;
+
+            try {
+                const obsTensor = getObservation();
+                const results = await session.run({
+                    'observation': obsTensor
+                });
+                
+                if (!results.action || !results.action.data) {
+                    throw new Error('잘못된 모델 출력');
+                }
+
+                const actionValues = Array.from(results.action.data).map(Number);
+                const actionProbs = softmax(actionValues);
+                const action = argmax(actionProbs);
+                
+                // 디버깅을 위한 로그
+                console.log({
+                    observation: Array.from(obsTensor.data),
+                    actionValues: actionValues,
+                    actionProbs: actionProbs,
+                    selectedAction: action
+                });
+
+                unicycle.update(action);
+                
+                if (unicycle.isSeatedFallen()) {
+                    gameOver = true;
+                    statusOverlay.textContent = "Fallen!";
+                    statusOverlay.style.opacity = 1;
+                    setTimeout(resetGame, 2000);
+                    return;
+                }
+
+                draw();
+                requestAnimationFrame(gameLoop);
+            } catch (error) {
+                console.error('Game loop error:', error);
+                console.error('Error details:', error.stack);
+                gameOver = true;
+            }
+        }
+
+        // getObservation 함수 수정
+        function getObservation() {
+            const u = unicycle;
+            const seatRect = u.getSeatRect();
+            const seatClearance = GROUND_Y - seatRect.bottom;
+            
+            // 정규화된 관찰 벡터 생성
+            const obs = new Float32Array(5);
+            obs[0] = Math.sin(u.angle);
+            obs[1] = Math.cos(u.angle);
+            obs[2] = clamp(u.angularVelocity / W_SCALE, -1.0, 1.0);
+            obs[3] = clamp(u.speed / V_SCALE, -1.0, 1.0);
+            obs[4] = clamp(seatClearance / CLEARANCE_SCALE, 0.0, 1.0);
+            
+            return new ort.Tensor('float32', obs, [1, 5]);
+        }
+
+        // 헬퍼 함수 추가
+        function clamp(value, min, max) {
+            return Math.min(Math.max(value, min), max);
+        }
+
+        // 헬퍼 함수들 추가
+        function softmax(arr) {
+            const max = Math.max(...arr);
+            const exp = arr.map(x => Math.exp(x - max));
+            const sum = exp.reduce((a, b) => a + b);
+            return exp.map(x => x / sum);
+        }
+
+        function argmax(arr) {
+            return arr.reduce((maxI, x, i, arr) => x > arr[maxI] ? i : maxI, 0);
+        }
+
+        // validateModelOutput 함수 수정
+        function validateModelOutput(output) {
+            console.log('모델 출력 검증:', output);
+            
+            // action 출력 확인
+            if (!output.action || !output.action.data) {
+                console.error('잘못된 모델 출력 구조:', output);
+                return false;
+            }
+
+            const actionData = Array.from(output.action.data).map(Number);
+            console.log('액션 값:', actionData);
+
+            if (actionData.length !== 5) {
+                console.error('예상치 못한 액션 수:', actionData.length);
+                return false;
+            }
+
+            return true;
+        }
+
+        // --- Initialization ---
+        async function main() {
+            // 캔버스 크기 설정 추가
+            canvas.width = SCREEN_WIDTH;
+            canvas.height = SCREEN_HEIGHT;
+            
+            try {
+                const options = {
+                    executionProviders: ['wasm'],
+                    graphOptimizationLevel: 'all'
+                };
+                
+                console.log('모델 로딩 중...');
+                session = await ort.InferenceSession.create('model.onnx', options);
+                
+                // 모델 구조 검증
+                console.log('모델 구조:', {
+                    inputs: session.inputNames,
+                    outputs: session.outputNames
+                });
+
+                // 테스트 추론
+                const testObs = new Float32Array(5).fill(0);
+                testObs[1] = 1;  // cos(angle) = 1 (수직 상태)
+                const testTensor = new ort.Tensor('float32', testObs, [1, 5]);
+                
+                const testResult = await session.run({
+                    'observation': testTensor
+                });
+                
+                console.log('테스트 추론 결과:', testResult);
+                
+                if (!validateModelOutput(testResult)) {
+                    throw new Error('모델 테스트 추론 실패');
+                }
+
+                loader.style.display = 'none';
+                resetGame();
+            } catch (e) {
+                console.error('모델 로딩 오류:', e);
+                loader.innerHTML = `
+                    <strong>모델 로딩 오류:</strong><br>
+                    <small>${e.message}</small><br>
+                    <small>자세한 내용은 콘솔을 확인하세요.</small>
+                `;
+            }
+        }
+
+        main();
+    });
+    </script>
+</body>
+</html>
